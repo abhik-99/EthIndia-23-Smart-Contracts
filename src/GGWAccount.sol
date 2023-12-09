@@ -14,12 +14,12 @@ import "account-abstraction/core/BaseAccount.sol";
 import "account-abstraction/samples/callback/TokenCallbackHandler.sol";
 
 /**
- * minimal account.
+ *  minimal account.
  *  this is sample minimal account.
  *  has execute, eth handling methods
  *  has a single signer that can send requests through the entryPoint.
  */
-contract SimpleAccount is
+contract GGWAccount is
     BaseAccount,
     TokenCallbackHandler,
     UUPSUpgradeable,
@@ -30,11 +30,14 @@ contract SimpleAccount is
     address public owner;
     mapping(address => uint8) inheritorShareMapping;
     mapping(address => bool) inheritorAddressMapping;
+    address[] inheritorsArr;
+
     uint8 inheritors;
     uint8 shareAgg;
 
     bool redemptionPeriodStarted;
-    uint redemptionPeriodStartTimestamp;
+    uint redemptionPeriodStartBlock;
+    address redemptionStarter;
 
     IEntryPoint private immutable _entryPoint;
 
@@ -117,14 +120,41 @@ contract SimpleAccount is
         );
     }
 
+    // Require the function call went through EntryPoint or owner or inheritors
+    function _requireFromEntryPointOrOwnerOrInheritor() internal view {
+        require(
+            msg.sender == address(entryPoint()) ||
+                msg.sender == owner ||
+                inheritorAddressMapping[msg.sender],
+            "account: not owner, inheritor or EntryPoint"
+        );
+    }
+
     /// implement template method of BaseAccount
     function _validateSignature(
         UserOperation calldata userOp,
         bytes32 userOpHash
     ) internal virtual override returns (uint256 validationData) {
         bytes32 hash = userOpHash.toEthSignedMessageHash();
-        if (SignatureChecker.isValidSignatureNow(owner, hash, userOp.signature))
+
+        if (
+            !SignatureChecker.isValidSignatureNow(owner, hash, userOp.signature)
+        ) {
+            uint8 inheritorsArrLength = uint8(inheritorsArr.length);
+            for (uint8 i = 0; i < inheritorsArrLength; i++) {
+                if (
+                    SignatureChecker.isValidSignatureNow(
+                        inheritorsArr[i],
+                        hash,
+                        userOp.signature
+                    )
+                ) {
+                    return 0;
+                }
+            }
             return SIG_VALIDATION_FAILED;
+        }
+
         return 0;
     }
 
@@ -175,10 +205,11 @@ contract SimpleAccount is
         }
         if (newInheritor) {
             require(
-                inheritorArrLength + 1 < type(uint8).max,
+                inheritors + 1 < type(uint8).max,
                 "Max no. inheritors reached"
             );
             inheritorAddressMapping[inheritor] = true;
+            inheritorsArr.push();
             ++inheritors;
         }
         inheritorShareMapping[inheritor] = share;
@@ -190,6 +221,41 @@ contract SimpleAccount is
         uint8 share = inheritorShareMapping[inheritor];
         shareAgg = shareAgg - share;
         inheritorShareMapping[inheritor] = 0;
+        uint8 inheritorsArrLength = uint8(inheritorsArr.length);
+        uint8 i = 0;
+        for (; i < inheritorsArrLength; i++) {
+            if (inheritorsArr[i] == inheritor) break;
+        }
+        inheritorsArr[i] = inheritorsArr[inheritorsArrLength - 1];
+        inheritorsArr.pop();
+    }
+
+    function startRedemption() external {
+        _requireFromEntryPointOrOwnerOrInheritor();
+        redemptionPeriodStarted = true;
+        redemptionPeriodStartBlock = block.number;
+        redemptionStarter = msg.sender;
+    }
+
+    function stopRedemption() external {
+        _requireFromEntryPointOrOwner();
+        redemptionPeriodStarted = true;
+    }
+
+    function redeem(address payable inheritor) external {
+        require(inheritorAddressMapping[inheritor], "not inheritor");
+        _requireFromEntryPointOrOwnerOrInheritor();
+        require(
+            redemptionPeriodStarted && block.number == redemptionPeriodStartBlock + 1,
+            "Period not elasped"
+        );
+        uint8 share = inheritorShareMapping[inheritor];
+        uint inheritorShare = (share *
+            entryPoint().getDepositInfo(address(this)).deposit) / 100;
+        entryPoint().withdrawTo(payable(inheritor), inheritorShare);
+        inheritorAddressMapping[inheritor] = false;
+        inheritorShareMapping[inheritor] = 0;
+        shareAgg = shareAgg - share;
     }
 
     function _authorizeUpgrade(
