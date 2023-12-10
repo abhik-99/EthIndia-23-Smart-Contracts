@@ -37,9 +37,12 @@ contract SybilNFTMain is
         LINK
     }
 
-    address immutable i_router;
-    address immutable i_link;
+    address public s_routerAddress;
+    address public s_linkTokenAddress;
 
+    IRouterClient private s_router;
+    LinkTokenInterface private s_linkToken;
+    error NotEnoughBalance(uint256 currentBalance, uint256 calculatedFees);
     event CloneReqSent(bytes32 messageId, uint tokenId, address owner);
 
     modifier onlyVerified(bytes memory sig) {
@@ -52,9 +55,8 @@ contract SybilNFTMain is
         address router,
         address link
     ) ERC721("SybilNFTResolver", "SNT") Ownable(initialOwner) {
-        i_router = router;
-        i_link = link;
-        LinkTokenInterface(i_link).approve(i_router, type(uint256).max);
+        s_routerAddress = router;
+        s_linkTokenAddress = link;
     }
 
     function safeMint(
@@ -62,6 +64,7 @@ contract SybilNFTMain is
         string memory uri,
         bytes memory signature
     ) public onlyVerified(signature) {
+        require(!addressMinted[to], "Already Minted");
         uint256 tokenId = _nextTokenId++;
         _safeMint(to, tokenId);
         _setTokenURI(tokenId, uri);
@@ -77,27 +80,34 @@ contract SybilNFTMain is
         require(_ownerOf(tokenId) == msg.sender, "not token owner");
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
             receiver: abi.encode(receiver),
-            data: abi.encodeWithSignature("_safeMint(address, tokenId)", msg.sender),
+            data: abi.encodeWithSignature(
+                "mintClone(address,uint)",
+                msg.sender, tokenId
+            ),
             tokenAmounts: new Client.EVMTokenAmount[](0),
             extraArgs: "",
-            feeToken: payFeesIn == PayFeesIn.LINK ? i_link : address(0)
+            feeToken: payFeesIn == PayFeesIn.LINK
+                ? s_linkTokenAddress
+                : address(0)
         });
+        IRouterClient router = IRouterClient(s_routerAddress);
         // Get the fee required to send the message
-        uint256 fees = s_router.getFee(
-            destinationChainSelector,
-            evm2AnyMessage
-        );
+        uint256 fees = router.getFee(destinationChainSelector, message);
 
         bytes32 messageId;
 
         if (payFeesIn == PayFeesIn.LINK) {
+            LinkTokenInterface token = LinkTokenInterface(s_linkTokenAddress);
+            if (fees > token.balanceOf(address(this)))
+                revert NotEnoughBalance(token.balanceOf(address(this)), fees);
+
+            // approve the Router to transfer LINK tokens on contract's behalf. It will spend the fees in LINK
+            token.approve(address(router), fees);
+
             // LinkTokenInterface(i_link).approve(i_router, fee);
-            messageId = IRouterClient(i_router).ccipSend(
-                destinationChainSelector,
-                message
-            );
+            messageId = router.ccipSend(destinationChainSelector, message);
         } else {
-            messageId = IRouterClient(i_router).ccipSend{value: fee}(
+            messageId = router.ccipSend{value: fees}(
                 destinationChainSelector,
                 message
             );
@@ -117,8 +127,7 @@ contract SybilNFTMain is
     }
 
     function verifiedSig(bytes memory signature) internal view returns (bool) {
-        bytes32 messageHash = keccak256(abi.encodePacked(_msgSender()));
-        bytes32 message = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        bytes32 message = MessageHashUtils.toEthSignedMessageHash(keccak256(abi.encodePacked(_msgSender())));
         return
             SignatureChecker.isValidSignatureNow(owner(), message, signature);
     }
